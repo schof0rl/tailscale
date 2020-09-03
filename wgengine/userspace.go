@@ -23,6 +23,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
+
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"github.com/tailscale/wireguard-go/wgcfg"
@@ -219,7 +231,75 @@ func newUserspaceEngineAdvanced(conf EngineConfig) (_ Engine, reterr error) {
 
 	// Respond to all pings only in fake mode.
 	if conf.Fake {
-		e.tundev.PostFilterIn = echoRespondToAll
+
+		ipstack := stack.New(stack.Options{
+			NetworkProtocols:   []stack.NetworkProtocol{ipv4.NewProtocol()},
+			TransportProtocols: []stack.TransportProtocol{tcp.NewProtocol(), udp.NewProtocol(), icmp.NewProtocol4()},
+		})
+
+		const mtu = 1500
+		linkEP := channel.New(512, mtu, "")
+
+		const nicID = 1
+		if err := ipstack.CreateNIC(nicID, linkEP); err != nil {
+			log.Fatal(err)
+		}
+
+		// IPv4 0.0.0.0/0
+		subnet, _ := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", 4)), tcpip.AddressMask(strings.Repeat("\x00", 4)))
+		ipstack.AddAddress(nicID, ipv4.ProtocolNumber, subnet.ID())
+
+		// use Forwarder to accept any connection from stack
+		fwd := tcp.NewForwarder(ipstack, 0, 16, func(r *tcp.ForwarderRequest) {
+			fmt.Printf("ForwarderRequest: %v\n", r)
+			var wq waiter.Queue
+			ep, err := r.CreateEndpoint(&wq)
+			if err != nil {
+				log.Fatalf("r.CreateEndpoint() = %v", err)
+			}
+			r.Complete(false)
+			c := gonet.NewTCPConn(&wq, ep)
+			log.Printf("endpoint: %v", ep.Info().(*tcp.EndpointInfo).ID)
+			// TCP echo
+			go echo(c)
+
+		})
+		ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+
+		//e.ipstack = ipstack
+
+		go func() {
+			for {
+				packetInfo, ok := linkEP.ReadContext(context.Background())
+				if !ok {
+					continue
+				}
+				pkt := packetInfo.Pkt
+				view := pkt.Data.ToView()
+				log.Printf("Packet Write out: % x % x\n", view)
+				if err := e.tundev.InjectOutbound([]byte(view)); err != nil {
+					log.Printf("netstack inject outbound: %v", err)
+					return
+				}
+
+			}
+		}()
+
+		e.tundev.PostFilterIn = func(p *packet.ParsedPacket, t *tstun.TUN) filter.Response {
+			var pn tcpip.NetworkProtocolNumber
+			switch p.IPVersion {
+			case 4:
+				pn = header.IPv4ProtocolNumber
+			case 6:
+				pn = header.IPv6ProtocolNumber
+			}
+			vv := buffer.View(append([]byte(nil), p.Buffer()...)).ToVectorisedView()
+			packetBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Data: vv,
+			})
+			linkEP.InjectInbound(pn, packetBuf)
+			return filter.Accept
+		}
 	}
 	e.tundev.PreFilterOut = e.handleLocalPackets
 
@@ -1275,4 +1355,19 @@ func linuxDistro() string {
 		return "arch"
 	}
 	return ""
+}
+
+func echo(c *gonet.TCPConn) {
+	defer c.Close()
+	io.WriteString(c, "Hello!\n")
+	buf := make([]byte, 1500)
+	for {
+		n, err := c.Read(buf)
+		if err != nil {
+			log.Printf("Err: %v", err)
+			break
+		}
+		c.Write(buf[:n])
+	}
+	log.Print("Connection closed")
 }
